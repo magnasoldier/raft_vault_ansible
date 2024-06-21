@@ -1,0 +1,239 @@
+---
+
+- name: Basic installation
+  hosts: all
+  become: yes
+  vars:
+    vault_data_path: /opt/vault/data
+
+  tasks:
+    - name: Update apt package index
+      apt:
+        update_cache: yes
+
+    - name: Install GPG and wget
+      apt:
+        name:
+          - gpg
+          - wget
+          - python3
+        state: present
+
+    - name: Download HashiCorp GPG key
+      get_url:
+        url: https://apt.releases.hashicorp.com/gpg
+        dest: /tmp/hashicorp.gpg
+
+    - name: Add HashiCorp GPG key
+      shell: |
+        gpg --dearmor --output /usr/share/keyrings/hashicorp-archive-keyring.gpg /tmp/hashicorp.gpg
+      args:
+        creates: /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+    - name: Verify HashiCorp GPG key fingerprint
+      command: gpg --no-default-keyring --keyring /usr/share/keyrings/hashicorp-archive-keyring.gpg --fingerprint
+
+    - name: Add repo
+      shell: |
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+
+    - name: Update apt package index after adding HashiCorp repository
+      apt:
+        update_cache: yes
+
+    - name: Install Vault
+      apt:
+        name: vault
+        state: present
+
+    - name: Create a directory for Vault data
+      ansible.builtin.file:
+        path: "{{ vault_data_path }}"
+        state: directory
+        owner: vault
+        group: vault
+        mode: '0755'
+
+    - name: Create a directory for Vault certs
+      ansible.builtin.file:
+        path: "{{ certs_path }}"
+        state: directory
+        owner: vault
+        group: vault
+        mode: '0755'
+
+    - name: Create Vault configuration file
+      template:
+        src: vault.hcl.j2
+        dest: /etc/vault.d/vault.hcl
+      vars:
+        api_addr: "https://{{ ansible_host }}:{{ vault_api_port }}"
+        cluster_addr: "https://{{ ansible_host }}:{{ cluster_port }}"
+
+
+
+- name: Master startup
+  hosts: master
+  become: true
+  vars:
+    unseal_script_path: ~/vault-playbook/files/scripts/unseal_vault.py
+    leader_host: "{{ hostvars['master-node']['ansible_host'] }}"
+    leader_address: "https://{{ leader_host }}:{{ vault_api_port }}"
+
+  tasks:
+    - name: Generate RSA private key for CA
+      ansible.builtin.command:
+        cmd: openssl genpkey -algorithm RSA -out ca-key.pem
+      args:
+        chdir: "{{ certs_path }}"
+
+    - name: Generate CA certificate
+      ansible.builtin.command:
+        cmd: openssl req -x509 -new -nodes -key ca-key.pem -sha256 -days 365 -out ca-cert.pem -subj "/C=US/ST=State/L=City/O=Organization/OU=Unit/CN=example.com"
+      args:
+        chdir: "{{ certs_path }}"
+
+    - name: Generate RSA private key for server
+      ansible.builtin.command:
+        cmd: openssl genpkey -algorithm RSA -out server-key.pem
+      args:
+        chdir: "{{ certs_path }}"
+
+    - name: Create san.cnf on target hosts
+      ansible.builtin.copy:
+        content: |
+          [req]
+          req_extensions = v3_req
+          distinguished_name = req_distinguished_name
+          [req_distinguished_name]
+          [ v3_req ]
+          subjectAltName = @alt_names
+          [alt_names]
+          IP.1 = {{ leader_host }}
+        dest: "{{ certs_path }}/san.cnf"
+
+    - name: Generate CSR using server key and SAN config
+      ansible.builtin.command:
+        cmd: openssl req -new -key server-key.pem -out server.csr -subj "/C=US/ST=State/L=City/O=Organization/OU=Unit/CN=example.com" -config san.cnf
+      args:
+        chdir: "{{ certs_path }}"
+
+    - name: Sign server certificate with CA
+      ansible.builtin.command:
+        cmd: openssl x509 -req -in server.csr -CA ca-cert.pem -CAkey ca-key.pem -CAcreateserial -out server-cert.pem -days 365 -sha256 -extfile san.cnf -extensions v3_req
+      args:
+        chdir: "{{ certs_path }}"
+
+    - name: Fetch CA certificate from master
+      ansible.builtin.fetch:
+        src: "{{ certs_path }}/ca-cert.pem"
+        dest: "/tmp/"
+        flat: true
+
+    - name: Fetch server key from master
+      ansible.builtin.fetch:
+        src: "{{ certs_path }}/server-key.pem"
+        dest: "/tmp/"
+        flat: true
+
+    - name: Fetch server cert from master
+      ansible.builtin.fetch:
+        src: "{{ certs_path }}/server-cert.pem"
+        dest: "/tmp/"
+        flat: true
+
+    - name: Start Vault server with nohup
+      shell: "nohup vault server -config=/etc/vault.d/vault.hcl >/dev/null 2>&1 &"
+      async: 0
+      poll: 0
+
+    - name: Init master
+      shell: "vault operator init -key-shares=5 -key-threshold=3 > /tmp/keys.txt"
+      environment:
+        VAULT_CACERT: "{{ certs_path }}/ca-cert.pem"
+        VAULT_ADDR: "{{ leader_address }}"
+
+    - name: Copy unseal script to remote host
+      copy:
+        src: "{{ unseal_script_path }}"
+        dest: /tmp/unseal_vault.py
+        mode: '0755'
+
+    - name: Unseal vault using Python script
+      shell: "python3 /tmp/unseal_vault.py"
+      environment:
+        VAULT_CACERT: "{{ certs_path }}/ca-cert.pem"
+        VAULT_ADDR: "{{ leader_address }}"
+      register: unseal_output
+
+    - name: Show unseal script output
+      debug:
+        var: unseal_output.stdout
+
+    - name: Fetch keys from master
+      ansible.builtin.fetch:
+        src: "/tmp/keys.txt"
+        dest: "/tmp/"
+        flat: true
+
+
+- name: Nodes startup
+  hosts: nodes
+  become: true
+  vars:
+    leader_host: "{{ hostvars['master-node']['ansible_host'] }}"
+    leader_address: "https://{{ leader_host }}:{{ vault_api_port }}"
+    unseal_script_path: ~/vault-playbook/files/scripts/unseal_vault.py
+  tasks:
+    - name: Copy CA certificate to nodes
+      ansible.builtin.copy:
+        src: "/tmp/ca-cert.pem"
+        dest: "{{ certs_path }}/"
+
+    - name: Copy server key to nodes
+      ansible.builtin.copy:
+        src: "/tmp/server-key.pem"
+        dest: "{{ certs_path }}/"
+
+    - name: Copy server certificate to nodes
+      ansible.builtin.copy:
+        src: "/tmp/server-cert.pem"
+        dest: "{{ certs_path }}/"
+
+    - name: Copy vault keys to nodes
+      ansible.builtin.copy:
+        src: "/tmp/keys.txt"
+        dest: "/tmp/"
+
+    - name: Start Vault server with nohup
+      shell: "nohup vault server -config=/etc/vault.d/vault.hcl >/dev/null 2>&1 &"
+      async: 0
+      poll: 0
+
+    - name: Join the Vault Raft cluster
+      shell: "vault operator raft join {{ leader_address }}"
+      environment:
+        VAULT_ADDR: "{{ leader_address }}"
+        VAULT_CACERT: "{{ certs_path }}/ca-cert.pem"
+      register: join_output
+
+    - name: Debug join output
+      debug:
+        var: join_output.stdout
+
+    - name: Copy unseal script to remote host
+      copy:
+        src: "{{ unseal_script_path }}"
+        dest: /tmp/unseal_vault.py
+        mode: '0755'
+
+    - name: Unseal vault using Python script
+      shell: "python3 /tmp/unseal_vault.py"
+      environment:
+        VAULT_ADDR: "{{ leader_address }}"
+        VAULT_CACERT: "{{ certs_path }}/ca-cert.pem"
+      register: unseal_output
+
+    - name: Show unseal script output
+      debug:
+        var: unseal_output.stdout
