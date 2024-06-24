@@ -1,5 +1,3 @@
----
-
 - name: Basic installation
   hosts: all
   become: yes
@@ -29,6 +27,11 @@
         gpg --dearmor --output /usr/share/keyrings/hashicorp-archive-keyring.gpg /tmp/hashicorp.gpg
       args:
         creates: /usr/share/keyrings/hashicorp-archive-keyring.gpg
+
+    - name: Remove HashiCorp GPG key file
+      file:
+        path: /tmp/hashicorp.gpg
+        state: absent
 
     - name: Verify HashiCorp GPG key fingerprint
       command: gpg --no-default-keyring --keyring /usr/share/keyrings/hashicorp-archive-keyring.gpg --fingerprint
@@ -70,13 +73,11 @@
         api_addr: "https://{{ ansible_host }}:{{ vault_api_port }}"
         cluster_addr: "https://{{ ansible_host }}:{{ cluster_port }}"
 
-
-
 - name: Master startup
   hosts: master
   become: true
   vars:
-    unseal_script_path: ~/vault-playbook/files/scripts/unseal_vault.py
+    unseal_script_path: "{{ playbook_dir }}/files/scripts/unseal_script.py"
     leader_host: "{{ hostvars['master-node']['ansible_host'] }}"
     leader_address: "https://{{ leader_host }}:{{ vault_api_port }}"
 
@@ -176,6 +177,15 @@
         dest: "/tmp/"
         flat: true
 
+    - name: Remove temporary keys file on master
+      file:
+        path: /tmp/keys.txt
+        state: absent
+
+    - name: Remove unseal script on master
+      file:
+        path: /tmp/unseal_vault.py
+        state: absent
 
 - name: Nodes startup
   hosts: nodes
@@ -183,7 +193,8 @@
   vars:
     leader_host: "{{ hostvars['master-node']['ansible_host'] }}"
     leader_address: "https://{{ leader_host }}:{{ vault_api_port }}"
-    unseal_script_path: ~/vault-playbook/files/scripts/unseal_vault.py
+    unseal_script_path: "{{ playbook_dir }}/files/scripts/unseal_script.py"
+
   tasks:
     - name: Copy CA certificate to nodes
       ansible.builtin.copy:
@@ -237,3 +248,28 @@
     - name: Show unseal script output
       debug:
         var: unseal_output.stdout
+
+    - name: Remove temporary CA certificate file
+      file:
+        path: /tmp/ca-cert.pem
+        state: absent
+
+    - name: Remove temporary server key file
+      file:
+        path: /tmp/server-key.pem
+        state: absent
+
+    - name: Remove temporary server certificate file
+      file:
+        path: /tmp/server-cert.pem
+        state: absent
+
+    - name: Remove temporary keys file
+      file:
+        path: /tmp/keys.txt
+        state: absent
+
+    - name: Remove unseal script
+      file:
+        path: /tmp/unseal_vault.py
+        state: absent
